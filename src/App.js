@@ -5,6 +5,9 @@ import {
   signInAnonymously,
   signInWithCustomToken,
   onAuthStateChanged,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
 } from "firebase/auth";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
 import {
@@ -18,6 +21,7 @@ import {
   UserPlus,
   ChevronRight,
   Award,
+  LogOut,
 } from "lucide-react";
 
 // ==========================================
@@ -38,7 +42,6 @@ const db = getFirestore(app);
 const appId =
   typeof __app_id !== "undefined" ? __app_id : "band-rehearsal-sync-v2";
 
-// Standard Band Roles
 const BAND_ROLES = [
   { id: "vocal", label: "🎙️ 보컬", isRhythm: false },
   { id: "guitar", label: "🎸 기타", isRhythm: false },
@@ -49,7 +52,6 @@ const BAND_ROLES = [
   { id: "other", label: "🎵 기타/스태프", isRhythm: false },
 ];
 
-// Date Generator Helper
 const generateDateRange = (startDateStr, endDateStr) => {
   const dates = [];
   let curr = new Date(startDateStr);
@@ -97,8 +99,9 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [roomId, setRoomId] = useState("");
   const [currentView, setCurrentView] = useState("home"); // 'home' | 'join' | 'main'
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
 
-  // Room Form State (Create Room)
+  // Room Form State
   const [createBandName, setCreateBandName] = useState("");
   const [createStartDate, setCreateStartDate] = useState(getTodayStr());
   const [createEndDate, setCreateEndDate] = useState(getFutureDateStr(14));
@@ -110,13 +113,13 @@ export default function App() {
   const [userNameInput, setUserNameInput] = useState("");
   const [userRoleInput, setUserRoleInput] = useState("vocal");
 
-  // Live Room Data from Firestore
+  // Live Room Data
   const [roomData, setRoomData] = useState(null);
-  const [activeTab, setActiveTab] = useState("vote"); // 'vote' | 'best' | 'members'
+  const [activeTab, setActiveTab] = useState("vote");
 
   // Optimistic Local Votes & Drag Painting State
   const [localVotes, setLocalVotes] = useState({});
-  const [paintMode, setPaintMode] = useState("available"); // 'available' | 'if_need_be' | 'unavailable'
+  const [paintMode, setPaintMode] = useState("available");
   const [isSaving, setIsSaving] = useState(false);
 
   const isDraggingRef = useRef(false);
@@ -128,7 +131,8 @@ export default function App() {
   const [copiedLink, setCopiedLink] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Keep ref synced with localVotes
+  const isGoogleUser = Boolean(user && !user.isAnonymous);
+
   useEffect(() => {
     localVotesRef.current = localVotes;
   }, [localVotes]);
@@ -137,24 +141,67 @@ export default function App() {
   // 1. FIREBASE AUTH INITIALIZATION
   // ----------------------------------------------------
   useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (
-          typeof __initial_auth_token !== "undefined" &&
-          __initial_auth_token
-        ) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      if (u) {
+        setUser(u);
+        if (!u.isAnonymous && u.displayName) {
+          setUserNameInput((prev) => prev || u.displayName);
         }
-      } catch (err) {
-        console.error("Auth init error:", err);
+      } else {
+        try {
+          if (
+            typeof __initial_auth_token !== "undefined" &&
+            __initial_auth_token
+          ) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (err) {
+          console.error("Auth init error:", err);
+        }
       }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    });
     return () => unsubscribe();
   }, []);
+
+  // Google Sign-In Handler
+  const handleGoogleLogin = async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      const result = await signInWithPopup(auth, provider);
+      const gUser = result.user;
+      if (gUser?.displayName) {
+        setUserNameInput(gUser.displayName);
+      }
+      // 이미 이 방에 가입된 구글 계정이면 바로 메인 화면으로 입장
+      if (roomData?.members?.[gUser.uid]) {
+        setMyMemberId(gUser.uid);
+        setIsEditingProfile(false);
+        setCurrentView("main");
+      }
+    } catch (err) {
+      console.error("Google login error:", err);
+      alert("구글 로그인 중 문제가 발생했습니다. 팝업 차단을 해제하고 다시 시도해 주세요.");
+    }
+  };
+
+  const handleGoogleLogout = async () => {
+    try {
+      await signOut(auth);
+      setMyMemberId("");
+      setUserNameInput("");
+      setIsEditingProfile(false);
+      if (roomId) {
+        localStorage.removeItem(`rehearsal_member_${roomId}`);
+        setCurrentView("join");
+      } else {
+        setCurrentView("home");
+      }
+    } catch (err) {
+      console.error("Logout error:", err);
+    }
+  };
 
   // ----------------------------------------------------
   // 2. CHECK URL HASH FOR DIRECT ROOM LINK
@@ -202,20 +249,30 @@ export default function App() {
         if (docSnap.exists()) {
           const data = docSnap.data();
           setRoomData(data);
-          // 드래그 중이 아닐 때만 서버 데이터로 동기화
           if (!isDraggingRef.current) {
             setLocalVotes(data.votes || {});
           }
 
+          if (isEditingProfile) return;
+
+          // 1순위: 구글 로그인 계정이 이미 이 방 멤버로 등록되어 있는 경우
+          if (!user.isAnonymous && data.members?.[user.uid]) {
+            setMyMemberId(user.uid);
+            setCurrentView("main");
+            return;
+          }
+
+          // 2순위: 브라우저에 저장된 게스트 세션이 있는 경우
           const storedMemberId = localStorage.getItem(
             `rehearsal_member_${roomId}`
           );
-          if (storedMemberId && data.members && data.members[storedMemberId]) {
+          if (storedMemberId && data.members?.[storedMemberId]) {
             setMyMemberId(storedMemberId);
             setCurrentView("main");
-          } else {
-            setCurrentView("join");
+            return;
           }
+
+          setCurrentView("join");
         } else {
           if (currentView !== "home") {
             setCurrentView("home");
@@ -228,9 +285,8 @@ export default function App() {
     );
 
     return () => unsubscribe();
-  }, [user, roomId]);
+  }, [user, roomId, isEditingProfile]);
 
-  // Derived Dates List & Hours
   const roomDates = useMemo(() => {
     if (!roomData?.startDate || !roomData?.endDate) return [];
     return generateDateRange(roomData.startDate, roomData.endDate);
@@ -278,7 +334,6 @@ export default function App() {
     }
   };
 
-  // Global MouseUp / TouchEnd listener to finish drag and save once
   useEffect(() => {
     const handleGlobalEnd = () => {
       if (isDraggingRef.current) {
@@ -295,7 +350,6 @@ export default function App() {
     };
   }, [user, roomId]);
 
-  // Paint a single cell optimistically
   const applyCellVote = (dateId, hour, status) => {
     const cellKey = `${dateId}_${hour}`;
     if (lastPaintedCellRef.current === cellKey) return;
@@ -318,8 +372,6 @@ export default function App() {
     if (!myMemberId) return;
     const currentStatus =
       localVotesRef.current?.[dateId]?.[hour]?.[myMemberId] || "unavailable";
-
-    // 이미 현재 브러시 상태와 같으면 지우기(unavailable)로 자동 전환
     const targetStatus =
       currentStatus === paintMode ? "unavailable" : paintMode;
 
@@ -348,7 +400,6 @@ export default function App() {
     }
   };
 
-  // Toggle entire day column on header click
   const handleToggleDayColumn = (dateId) => {
     if (!myMemberId) return;
     const prev = localVotesRef.current || {};
@@ -371,7 +422,6 @@ export default function App() {
     saveVotesToFirestore(next);
   };
 
-  // Quick Presets across ALL dates
   const handleQuickPresetFill = (presetType) => {
     if (!myMemberId) return;
     const next = { ...(localVotesRef.current || {}) };
@@ -449,7 +499,11 @@ export default function App() {
     if (!userNameInput.trim() || !user || !roomId || !roomData) return;
 
     setIsSubmitting(true);
-    const memberId = "m_" + Math.random().toString(36).substr(2, 7);
+    // 구글 로그인 사용자는 고유 uid를 사용하여 중복 생성 방지
+    const memberId = isGoogleUser
+      ? user.uid
+      : myMemberId || "m_" + Math.random().toString(36).substr(2, 7);
+
     const roleObj =
       BAND_ROLES.find((r) => r.id === userRoleInput) || BAND_ROLES[0];
 
@@ -461,7 +515,9 @@ export default function App() {
         roleId: userRoleInput,
         roleLabel: roleObj.label,
         isRhythm: roleObj.isRhythm,
-        joinedAt: new Date().toISOString(),
+        isGoogle: isGoogleUser,
+        joinedAt:
+          roomData.members?.[memberId]?.joinedAt || new Date().toISOString(),
       },
     };
 
@@ -477,8 +533,11 @@ export default function App() {
       );
       await setDoc(roomRef, { members: updatedMembers }, { merge: true });
 
-      localStorage.setItem(`rehearsal_member_${roomId}`, memberId);
+      if (!isGoogleUser) {
+        localStorage.setItem(`rehearsal_member_${roomId}`, memberId);
+      }
       setMyMemberId(memberId);
+      setIsEditingProfile(false);
       setCurrentView("main");
     } catch (err) {
       console.error("Join room error:", err);
@@ -494,11 +553,13 @@ export default function App() {
     setTimeout(() => setCopiedLink(false), 2200);
   };
 
-  const handleLeaveRoom = () => {
-    if (roomId) {
-      localStorage.removeItem(`rehearsal_member_${roomId}`);
+  const handleEditProfile = () => {
+    const me = roomData?.members?.[myMemberId];
+    if (me) {
+      setUserNameInput(me.name);
+      setUserRoleInput(me.roleId);
     }
-    setMyMemberId("");
+    setIsEditingProfile(true);
     setCurrentView("join");
   };
 
@@ -730,7 +791,7 @@ export default function App() {
   }
 
   // ==========================================
-  // VIEW 2: MEMBER JOIN SCREEN (SELECT ROLE)
+  // VIEW 2: MEMBER JOIN SCREEN (GOOGLE LOGIN + ROLE)
   // ==========================================
   if (currentView === "join") {
     return (
@@ -739,7 +800,7 @@ export default function App() {
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
             <div className="space-y-1">
               <span className="text-[10px] uppercase tracking-wider text-indigo-400 font-bold">
-                합주 조율 모임 입장
+                {isEditingProfile ? "내 프로필 수정" : "합주 조율 모임 입장"}
               </span>
               <h1 className="text-xl font-black text-white">
                 {roomData?.bandName || "밴드 일정"}
@@ -750,6 +811,44 @@ export default function App() {
                   {roomData?.startDate} ~ {roomData?.endDate}
                 </span>
               </p>
+            </div>
+
+            {/* GOOGLE LOGIN SECTION */}
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+              {isGoogleUser ? (
+                <div className="flex items-center justify-between text-xs">
+                  <div>
+                    <span className="text-emerald-400 font-bold block">
+                      ✓ Google 계정 연결됨
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      {user.email}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleGoogleLogout}
+                    className="text-[11px] text-slate-400 hover:text-rose-400 underline"
+                  >
+                    계정 변경
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleGoogleLogin}
+                    className="w-full py-2.5 px-3 bg-white hover:bg-slate-100 text-slate-900 font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow transition-all"
+                  >
+                    <span className="font-black text-sm text-blue-600">G</span>
+                    <span>Google로 로그인 (내 시간표 영구 유지)</span>
+                  </button>
+                  <p className="text-[10px] text-slate-500 text-center">
+                    구글로 로그인하면 다른 기기에서도 중복 없이 내 일정을
+                    수정할 수 있습니다.
+                  </p>
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleJoinRoom} className="space-y-4 text-xs">
@@ -794,7 +893,9 @@ export default function App() {
                 disabled={isSubmitting}
                 className="w-full py-3 bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-extrabold rounded-xl shadow-lg shadow-indigo-600/30 hover:opacity-95 active:scale-98 transition-all flex items-center justify-center gap-1.5 text-sm"
               >
-                <span>입장하여 시간표 칠하기</span>
+                <span>
+                  {isEditingProfile ? "프로필 저장하기" : "입장하여 시간표 칠하기"}
+                </span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </form>
@@ -802,12 +903,17 @@ export default function App() {
 
           <button
             onClick={() => {
-              window.location.hash = "";
-              setCurrentView("home");
+              if (isEditingProfile) {
+                setIsEditingProfile(false);
+                setCurrentView("main");
+              } else {
+                window.location.hash = "";
+                setCurrentView("home");
+              }
             }}
             className="w-full py-2 text-xs text-slate-400 hover:text-slate-200 text-center"
           >
-            ← 홈으로 돌아가기
+            {isEditingProfile ? "← 시간표로 돌아가기" : "← 홈으로 돌아가기"}
           </button>
         </div>
       </div>
@@ -830,408 +936,15 @@ export default function App() {
               <Music className="w-5 h-5" />
             </div>
             <div>
-              <h1 className="font-extrabold text-sm text-white leading-tight truncate max-w-[180px] sm:max-w-xs">
+              <h1 className="font-extrabold text-sm text-white leading-tight truncate max-w-[160px] sm:max-w-xs">
                 {roomData?.bandName}
               </h1>
-              <p className="text-[10px] text-slate-400 flex items-center gap-1">
+              <p className="text-[10px] text-slate-400 flex items-center gap-1.5">
                 <span>
                   {currentMemberObj
                     ? `${currentMemberObj.name} (${currentMemberObj.roleLabel})`
                     : "참여자"}
                 </span>
-                <span className="text-slate-600">•</span>
                 <button
-                  onClick={handleLeaveRoom}
-                  className="text-indigo-400 underline"
-                >
-                  변경
-                </button>
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {isSaving && (
-              <span className="text-[10px] text-indigo-300 animate-pulse">
-                저장 중...
-              </span>
-            )}
-            <button
-              onClick={handleCopyShareLink}
-              className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow flex items-center gap-1.5 active:scale-95 transition-all"
-            >
-              <Share2 className="w-3.5 h-3.5" />
-              <span>{copiedLink ? "복사됨!" : "초대 링크"}</span>
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* MAIN CONTENT WRAPPER */}
-      <main className="max-w-3xl mx-auto px-3 sm:px-4 pt-3 space-y-3">
-        {/* TAB SEGMENT CONTROL */}
-        <div className="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-xs font-medium">
-          <button
-            onClick={() => setActiveTab("vote")}
-            className={`py-2 rounded-lg flex items-center justify-center gap-1 transition-all ${
-              activeTab === "vote"
-                ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow font-bold"
-                : "text-slate-400 hover:text-slate-200"
-            }`}
-          >
-            <Calendar className="w-3.5 h-3.5" />
-            <span>시간 칠하기</span>
-          </button>
-          <button
-            onClick={() => setActiveTab("best")}
-            className={`py-2 rounded-lg flex items-center justify-center gap-1 transition-all ${
-              activeTab === "best"
-                ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow font-bold"
-                : "text-slate-400 hover:text-slate-200"
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5 text-amber-300" />
-            <span>최적 타임</span>
-          </button>
-          <button
-            onClick={() => setActiveTab("members")}
-            className={`py-2 rounded-lg flex items-center justify-center gap-1 transition-all ${
-              activeTab === "members"
-                ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow font-bold"
-                : "text-slate-400 hover:text-slate-200"
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            <span>멤버 ({membersCount})</span>
-          </button>
-        </div>
-
-        {/* TAB 1: MULTI-DAY DRAG GRID */}
-        {activeTab === "vote" && (
-          <div className="space-y-2.5">
-            {/* PAINT BRUSH & QUICK PRESETS BAR */}
-            <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-900/80 p-2.5 rounded-xl border border-slate-800 text-xs">
-              {/* Brush Mode Selector */}
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setPaintMode("available")}
-                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
-                    paintMode === "available"
-                      ? "bg-emerald-600 text-white border-emerald-400 shadow"
-                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
-                  }`}
-                >
-                  🟢 가능
-                </button>
-                <button
-                  onClick={() => setPaintMode("if_need_be")}
-                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
-                    paintMode === "if_need_be"
-                      ? "bg-amber-600 text-white border-amber-400 shadow"
-                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
-                  }`}
-                >
-                  🟡 조율
-                </button>
-                <button
-                  onClick={() => setPaintMode("unavailable")}
-                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
-                    paintMode === "unavailable"
-                      ? "bg-rose-600 text-white border-rose-400 shadow"
-                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
-                  }`}
-                >
-                  🔴 지우기
-                </button>
-              </div>
-
-              {/* Global Quick Presets */}
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => handleQuickPresetFill("evening")}
-                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[11px] font-bold border border-slate-700"
-                >
-                  저녁만
-                </button>
-                <button
-                  onClick={() => handleQuickPresetFill("all")}
-                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 text-[11px] font-bold border border-slate-700"
-                >
-                  전체 가능
-                </button>
-                <button
-                  onClick={() => handleQuickPresetFill("clear")}
-                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-rose-300 text-[11px] font-bold border border-slate-700"
-                >
-                  전체 취소
-                </button>
-              </div>
-            </div>
-
-            <p className="text-[11px] text-slate-400 px-1">
-              💡 칸을 누른 채 드래그하면 여러 시간·요일이 한 번에 칠해집니다.
-              날짜 제목을 누르면 그날 하루 전체가 선택/취소됩니다.
-            </p>
-
-            {/* MULTI-DAY SCROLLABLE GRID */}
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-              <div className="overflow-x-auto">
-                <table
-                  className="w-full border-collapse select-none"
-                  onTouchMove={handleGridTouchMove}
-                >
-                  <thead>
-                    <tr className="bg-slate-950/90 border-b border-slate-800">
-                      <th className="sticky left-0 z-20 bg-slate-950 w-14 min-w-[56px] py-2.5 text-[10px] font-bold text-slate-400 border-r border-slate-800">
-                        시간
-                      </th>
-                      {roomDates.map((day) => (
-                        <th
-                          key={day.id}
-                          onClick={() => handleToggleDayColumn(day.id)}
-                          title="클릭하여 이 날짜 전체 선택/해제"
-                          className="min-w-[64px] py-2 px-1 text-center border-r border-slate-800/60 cursor-pointer hover:bg-slate-800/80 transition-colors"
-                        >
-                          <div
-                            className={`text-[10px] font-bold ${
-                              day.isWeekend
-                                ? "text-amber-400"
-                                : "text-slate-400"
-                            }`}
-                          >
-                            {day.dayName}
-                          </div>
-                          <div className="text-xs font-black text-slate-100">
-                            {day.monthNum}/{day.dateNum}
-                          </div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {roomHours.map((slot) => (
-                      <tr
-                        key={slot.hour}
-                        className="border-b border-slate-800/60 last:border-b-0"
-                      >
-                        {/* Sticky Time Column */}
-                        <td className="sticky left-0 z-10 bg-slate-950/95 text-[11px] font-bold text-slate-400 text-center py-2.5 border-r border-slate-800">
-                          {slot.shortLabel}
-                        </td>
-
-                        {/* Date Cells */}
-                        {roomDates.map((day) => {
-                          const hourVotes =
-                            localVotes?.[day.id]?.[slot.hour] || {};
-                          const myStatus =
-                            hourVotes[myMemberId] || "unavailable";
-
-                          let availCount = 0;
-                          membersList.forEach((m) => {
-                            if (hourVotes[m.id] === "available") availCount++;
-                          });
-
-                          let cellStyle =
-                            "bg-slate-900/50 hover:bg-slate-800/80 text-slate-500";
-                          if (myStatus === "available") {
-                            cellStyle =
-                              "bg-emerald-500/35 hover:bg-emerald-500/45 text-emerald-200 border-emerald-500/40";
-                          } else if (myStatus === "if_need_be") {
-                            cellStyle =
-                              "bg-amber-500/35 hover:bg-amber-500/45 text-amber-200 border-amber-500/40";
-                          }
-
-                          return (
-                            <td
-                              key={`${day.id}_${slot.hour}`}
-                              data-date={day.id}
-                              data-hour={slot.hour}
-                              onMouseDown={(e) => {
-                                e.preventDefault();
-                                handleCellStart(day.id, slot.hour);
-                              }}
-                              onMouseEnter={() =>
-                                handleCellEnter(day.id, slot.hour)
-                              }
-                              onTouchStart={() =>
-                                handleCellStart(day.id, slot.hour)
-                              }
-                              className={`h-10 text-center border-r border-slate-800/50 cursor-pointer touch-none transition-colors duration-75 ${cellStyle}`}
-                            >
-                              <div className="flex flex-col items-center justify-center leading-none">
-                                <span className="text-[11px] font-extrabold">
-                                  {myStatus === "available"
-                                    ? "●"
-                                    : myStatus === "if_need_be"
-                                    ? "▲"
-                                    : ""}
-                                </span>
-                                {availCount > 0 && (
-                                  <span className="text-[9px] font-bold opacity-80 mt-0.5">
-                                    {availCount}/{membersCount}
-                                  </span>
-                                )}
-                              </div>
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 2: BEST SLOTS RECOMMENDATION RANKINGS */}
-        {activeTab === "best" && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between px-1">
-              <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-                <Award className="w-4 h-4 text-amber-400" />
-                <span>최적 합주 타임 랭킹 (2시간 연속)</span>
-              </h3>
-            </div>
-
-            {bestRehearsalSlots.length === 0 ? (
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center text-xs text-slate-400">
-                멤버들의 가능 시간 입력이 더 필요합니다.
-              </div>
-            ) : (
-              bestRehearsalSlots.map((slot, idx) => (
-                <div
-                  key={idx}
-                  className={`bg-slate-900 rounded-2xl p-4 border space-y-3 relative overflow-hidden ${
-                    idx === 0
-                      ? "border-indigo-500/60 shadow-lg shadow-indigo-500/10 bg-gradient-to-br from-indigo-950/40 to-slate-900"
-                      : "border-slate-800"
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`w-6 h-6 rounded-full font-black text-xs flex items-center justify-center ${
-                          idx === 0
-                            ? "bg-amber-400 text-slate-950"
-                            : "bg-slate-800 text-slate-300"
-                        }`}
-                      >
-                        {idx + 1}
-                      </span>
-                      <span className="font-extrabold text-sm text-slate-100">
-                        {slot.monthNum}월 {slot.dateNum}일 ({slot.dayName})
-                      </span>
-                    </div>
-
-                    <span className="text-xs font-black text-indigo-300 bg-indigo-500/20 px-2.5 py-1 rounded-xl border border-indigo-500/30">
-                      {slot.timeLabel}
-                    </span>
-                  </div>
-
-                  <div className="flex items-center justify-between text-xs bg-slate-950/60 p-2.5 rounded-xl border border-slate-800">
-                    <div className="flex items-center gap-2">
-                      <span className="font-black text-emerald-400 text-sm">
-                        {slot.availableCount}/{slot.totalMembers}명 가능
-                      </span>
-                      {slot.isRhythmComplete && (
-                        <span className="text-[10px] font-bold text-amber-300 bg-amber-500/20 px-2 py-0.5 rounded-md border border-amber-500/30">
-                          🥁+🎸 리듬세션 완비
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5">
-                    {slot.memberBreakdown.map((m) => (
-                      <div
-                        key={m.id}
-                        className={`p-2 rounded-xl border text-center flex flex-col items-center justify-center ${
-                          m.status === "available"
-                            ? "bg-emerald-950/40 border-emerald-500/40 text-emerald-300"
-                            : m.status === "if_need_be"
-                            ? "bg-amber-950/40 border-amber-500/40 text-amber-300"
-                            : "bg-slate-950 border-slate-800 text-slate-500 line-through opacity-50"
-                        }`}
-                      >
-                        <span className="text-[10px] font-bold">{m.name}</span>
-                        <span className="text-[9px] opacity-80">
-                          {m.roleLabel.split(" ")[0]}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        )}
-
-        {/* TAB 3: MEMBERS ROSTER */}
-        {activeTab === "members" && (
-          <div className="space-y-3">
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                <h3 className="font-extrabold text-xs text-slate-200">
-                  참여 밴드원 리스트 ({membersCount}명)
-                </h3>
-                <button
-                  onClick={handleCopyShareLink}
-                  className="text-xs text-indigo-400 font-bold flex items-center gap-1"
-                >
-                  <UserPlus className="w-3.5 h-3.5" />
-                  <span>멤버 추가 초대</span>
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                {membersList.map((m) => (
-                  <div
-                    key={m.id}
-                    className="flex items-center justify-between p-2.5 bg-slate-950 rounded-xl border border-slate-800"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div className="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-xs text-indigo-300">
-                        {m.name.slice(0, 1)}
-                      </div>
-                      <div>
-                        <div className="font-bold text-xs text-slate-100 flex items-center gap-1.5">
-                          <span>{m.name}</span>
-                          {m.id === myMemberId && (
-                            <span className="bg-indigo-600 text-white text-[9px] px-1.5 rounded-md">
-                              나
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[10px] text-slate-400">
-                          {m.roleLabel}
-                        </div>
-                      </div>
-                    </div>
-
-                    <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-md border border-emerald-500/20">
-                      입장 완료
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 text-xs text-slate-400 space-y-1">
-              <div>
-                초대 코드:{" "}
-                <span className="font-mono text-indigo-300">{roomId}</span>
-              </div>
-              <div>
-                설정 기간: {roomData?.startDate} ~ {roomData?.endDate}
-              </div>
-              <div>
-                시간대: {roomData?.startHour}:00 ~ {roomData?.endHour}:00
-              </div>
-            </div>
-          </div>
-        )}
-      </main>
-    </div>
-  );
-}
+                  onClick={handleEditProfile}
+                  className="text-
