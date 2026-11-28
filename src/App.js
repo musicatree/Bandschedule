@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import {
   getAuth,
@@ -10,25 +10,14 @@ import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
 import {
   Music,
   Calendar,
-  Clock,
   Users,
   Share2,
   Sparkles,
-  CheckCircle2,
-  XCircle,
-  HelpCircle,
-  Check,
-  Copy,
-  Zap,
   Plus,
   ArrowRight,
   UserPlus,
-  Settings,
-  LogIn,
-  Link as LinkIcon,
   ChevronRight,
   Award,
-  RefreshCw,
 } from "lucide-react";
 
 // ==========================================
@@ -65,7 +54,6 @@ const generateDateRange = (startDateStr, endDateStr) => {
   const dates = [];
   let curr = new Date(startDateStr);
   const end = new Date(endDateStr);
-
   const dayNames = ["일", "월", "화", "수", "목", "금", "토"];
 
   while (curr <= end) {
@@ -88,7 +76,6 @@ const generateDateRange = (startDateStr, endDateStr) => {
   return dates;
 };
 
-// Default Date Utility (Today to 2 weeks later)
 const getTodayStr = () => new Date().toISOString().split("T")[0];
 const getFutureDateStr = (daysAhead) => {
   const d = new Date();
@@ -96,7 +83,6 @@ const getFutureDateStr = (daysAhead) => {
   return d.toISOString().split("T")[0];
 };
 
-// Generate Short Room ID
 const generateRoomId = () => {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   let result = "band-";
@@ -115,7 +101,7 @@ export default function App() {
   // Room Form State (Create Room)
   const [createBandName, setCreateBandName] = useState("");
   const [createStartDate, setCreateStartDate] = useState(getTodayStr());
-  const [createEndDate, setCreateEndDate] = useState(getFutureDateStr(14)); // 2 weeks default
+  const [createEndDate, setCreateEndDate] = useState(getFutureDateStr(14));
   const [createStartHour, setCreateStartHour] = useState(10);
   const [createEndHour, setCreateEndHour] = useState(23);
 
@@ -126,17 +112,26 @@ export default function App() {
 
   // Live Room Data from Firestore
   const [roomData, setRoomData] = useState(null);
-  const [selectedDateId, setSelectedDateId] = useState("");
   const [activeTab, setActiveTab] = useState("vote"); // 'vote' | 'best' | 'members'
 
-  // Range Selection Mode State
-  const [isRangeMode, setIsRangeMode] = useState(false);
-  const [rangeStartHour, setRangeStartHour] = useState(null);
+  // Optimistic Local Votes & Drag Painting State
+  const [localVotes, setLocalVotes] = useState({});
+  const [paintMode, setPaintMode] = useState("available"); // 'available' | 'if_need_be' | 'unavailable'
+  const [isSaving, setIsSaving] = useState(false);
+
+  const isDraggingRef = useRef(false);
+  const dragTargetStatusRef = useRef("available");
+  const localVotesRef = useRef({});
+  const lastPaintedCellRef = useRef("");
 
   // UI Utilities
   const [copiedLink, setCopiedLink] = useState(false);
-  const [showShareModal, setShowShareModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Keep ref synced with localVotes
+  useEffect(() => {
+    localVotesRef.current = localVotes;
+  }, [localVotes]);
 
   // ----------------------------------------------------
   // 1. FIREBASE AUTH INITIALIZATION
@@ -171,7 +166,6 @@ export default function App() {
         const targetRoom = hash.replace("#room=", "").trim();
         if (targetRoom) {
           setRoomId(targetRoom);
-          // Check local storage for existing session in this room
           const savedMemberId = localStorage.getItem(
             `rehearsal_member_${targetRoom}`
           );
@@ -192,7 +186,6 @@ export default function App() {
   useEffect(() => {
     if (!user || !roomId) return;
 
-    // RULE 1 Path: /artifacts/{appId}/public/data/rehearsalRooms/{roomId}
     const roomRef = doc(
       db,
       "artifacts",
@@ -209,13 +202,11 @@ export default function App() {
         if (docSnap.exists()) {
           const data = docSnap.data();
           setRoomData(data);
-
-          // Auto set initial selected date if not set
-          if (!selectedDateId && data.startDate) {
-            setSelectedDateId(data.startDate);
+          // 드래그 중이 아닐 때만 서버 데이터로 동기화
+          if (!isDraggingRef.current) {
+            setLocalVotes(data.votes || {});
           }
 
-          // Route to appropriate view
           const storedMemberId = localStorage.getItem(
             `rehearsal_member_${roomId}`
           );
@@ -226,7 +217,6 @@ export default function App() {
             setCurrentView("join");
           }
         } else {
-          // Room does not exist yet
           if (currentView !== "home") {
             setCurrentView("home");
           }
@@ -239,11 +229,6 @@ export default function App() {
 
     return () => unsubscribe();
   }, [user, roomId]);
-
-  // Reset range mode when date changes
-  useEffect(() => {
-    setRangeStartHour(null);
-  }, [selectedDateId]);
 
   // Derived Dates List & Hours
   const roomDates = useMemo(() => {
@@ -259,18 +244,164 @@ export default function App() {
     for (let h = start; h < end; h++) {
       hours.push({
         hour: h,
+        shortLabel: `${String(h).padStart(2, "0")}:00`,
         label: `${String(h).padStart(2, "0")}:00 - ${String(h + 1).padStart(
           2,
           "0"
         )}:00`,
-        tag: h < 12 ? "오전" : h < 18 ? "오후" : h < 22 ? "저녁" : "야간",
       });
     }
     return hours;
   }, [roomData]);
 
   // ----------------------------------------------------
-  // 4. ACTION HANDLERS (Create Room, Join Room, Vote)
+  // 4. SAVE VOTES TO FIRESTORE (BATCH)
+  // ----------------------------------------------------
+  const saveVotesToFirestore = async (votesToSave) => {
+    if (!user || !roomId) return;
+    setIsSaving(true);
+    try {
+      const roomRef = doc(
+        db,
+        "artifacts",
+        appId,
+        "public",
+        "data",
+        "rehearsalRooms",
+        roomId
+      );
+      await setDoc(roomRef, { votes: votesToSave }, { merge: true });
+    } catch (err) {
+      console.error("Save votes error:", err);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Global MouseUp / TouchEnd listener to finish drag and save once
+  useEffect(() => {
+    const handleGlobalEnd = () => {
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        lastPaintedCellRef.current = "";
+        saveVotesToFirestore(localVotesRef.current);
+      }
+    };
+    window.addEventListener("mouseup", handleGlobalEnd);
+    window.addEventListener("touchend", handleGlobalEnd);
+    return () => {
+      window.removeEventListener("mouseup", handleGlobalEnd);
+      window.removeEventListener("touchend", handleGlobalEnd);
+    };
+  }, [user, roomId]);
+
+  // Paint a single cell optimistically
+  const applyCellVote = (dateId, hour, status) => {
+    const cellKey = `${dateId}_${hour}`;
+    if (lastPaintedCellRef.current === cellKey) return;
+    lastPaintedCellRef.current = cellKey;
+
+    setLocalVotes((prev) => {
+      const dateVotes = prev[dateId] ? { ...prev[dateId] } : {};
+      const hourVotes = dateVotes[hour] ? { ...dateVotes[hour] } : {};
+      if (hourVotes[myMemberId] === status) return prev;
+
+      hourVotes[myMemberId] = status;
+      dateVotes[hour] = hourVotes;
+      const next = { ...prev, [dateId]: dateVotes };
+      localVotesRef.current = next;
+      return next;
+    });
+  };
+
+  const handleCellStart = (dateId, hour) => {
+    if (!myMemberId) return;
+    const currentStatus =
+      localVotesRef.current?.[dateId]?.[hour]?.[myMemberId] || "unavailable";
+
+    // 이미 현재 브러시 상태와 같으면 지우기(unavailable)로 자동 전환
+    const targetStatus =
+      currentStatus === paintMode ? "unavailable" : paintMode;
+
+    isDraggingRef.current = true;
+    dragTargetStatusRef.current = targetStatus;
+    lastPaintedCellRef.current = "";
+    applyCellVote(dateId, hour, targetStatus);
+  };
+
+  const handleCellEnter = (dateId, hour) => {
+    if (!isDraggingRef.current || !myMemberId) return;
+    applyCellVote(dateId, hour, dragTargetStatusRef.current);
+  };
+
+  const handleGridTouchMove = (e) => {
+    if (!isDraggingRef.current || !myMemberId) return;
+    const touch = e.touches[0];
+    const el = document.elementFromPoint(touch.clientX, touch.clientY);
+    const cell = el?.closest?.("[data-date][data-hour]");
+    if (cell) {
+      const dateId = cell.getAttribute("data-date");
+      const hour = parseInt(cell.getAttribute("data-hour"), 10);
+      if (dateId && !isNaN(hour)) {
+        applyCellVote(dateId, hour, dragTargetStatusRef.current);
+      }
+    }
+  };
+
+  // Toggle entire day column on header click
+  const handleToggleDayColumn = (dateId) => {
+    if (!myMemberId) return;
+    const prev = localVotesRef.current || {};
+    const dateVotes = prev[dateId] ? { ...prev[dateId] } : {};
+
+    const allAlreadyMarked = roomHours.every(
+      (slot) => dateVotes[slot.hour]?.[myMemberId] === paintMode
+    );
+    const targetStatus = allAlreadyMarked ? "unavailable" : paintMode;
+
+    roomHours.forEach((slot) => {
+      const hourVotes = dateVotes[slot.hour] ? { ...dateVotes[slot.hour] } : {};
+      hourVotes[myMemberId] = targetStatus;
+      dateVotes[slot.hour] = hourVotes;
+    });
+
+    const next = { ...prev, [dateId]: dateVotes };
+    setLocalVotes(next);
+    localVotesRef.current = next;
+    saveVotesToFirestore(next);
+  };
+
+  // Quick Presets across ALL dates
+  const handleQuickPresetFill = (presetType) => {
+    if (!myMemberId) return;
+    const next = { ...(localVotesRef.current || {}) };
+
+    roomDates.forEach((day) => {
+      const dateVotes = { ...(next[day.id] || {}) };
+      roomHours.forEach((slot) => {
+        const h = slot.hour;
+        const hourVotes = { ...(dateVotes[h] || {}) };
+
+        if (presetType === "evening") {
+          hourVotes[myMemberId] =
+            h >= 18 && h <= 22 ? "available" : "unavailable";
+        } else if (presetType === "all") {
+          hourVotes[myMemberId] = "available";
+        } else if (presetType === "clear") {
+          hourVotes[myMemberId] = "unavailable";
+        }
+        dateVotes[h] = hourVotes;
+      });
+      next[day.id] = dateVotes;
+    });
+
+    setLocalVotes(next);
+    localVotesRef.current = next;
+    saveVotesToFirestore(next);
+  };
+
+  // ----------------------------------------------------
+  // 5. ROOM CREATE / JOIN / SHARE HANDLERS
   // ----------------------------------------------------
   const handleCreateRoom = async (e) => {
     e.preventDefault();
@@ -284,8 +415,8 @@ export default function App() {
       bandName: createBandName.trim(),
       startDate: createStartDate,
       endDate: createEndDate,
-      startHour: parseInt(createStartHour),
-      endHour: parseInt(createEndHour),
+      startHour: parseInt(createStartHour, 10),
+      endHour: parseInt(createEndHour, 10),
       createdAt: new Date().toISOString(),
       members: {},
       votes: {},
@@ -305,7 +436,6 @@ export default function App() {
 
       setRoomId(newRoomId);
       window.location.hash = `#room=${newRoomId}`;
-      setSelectedDateId(createStartDate);
       setCurrentView("join");
     } catch (err) {
       console.error("Create room error:", err);
@@ -357,140 +487,6 @@ export default function App() {
     }
   };
 
-  const handleToggleSlotStatus = async (dateId, hour) => {
-    if (!user || !roomId || !myMemberId || !roomData) return;
-
-    const currentVotes = roomData.votes || {};
-    const dateVotes = currentVotes[dateId] ? { ...currentVotes[dateId] } : {};
-    const hourVotes = dateVotes[hour] ? { ...dateVotes[hour] } : {};
-    const currentMyStatus = hourVotes[myMemberId] || "unavailable";
-
-    // Cycle: available -> if_need_be -> unavailable -> available
-    let nextStatus = "available";
-    if (currentMyStatus === "available") nextStatus = "if_need_be";
-    else if (currentMyStatus === "if_need_be") nextStatus = "unavailable";
-
-    if (isRangeMode) {
-      if (rangeStartHour === null) {
-        // 첫 번째 탭: 시작 시간 지정
-        setRangeStartHour(hour);
-        return;
-      } else {
-        // 두 번째 탭: 종료 시간 지정 및 사이 영역 채우기
-        const start = Math.min(rangeStartHour, hour);
-        const end = Math.max(rangeStartHour, hour);
-
-        // 시작 시간의 원래 상태를 기준으로 사이클 진행
-        const startStatusBefore =
-          (dateVotes[rangeStartHour] || {})[myMemberId] || "unavailable";
-        let applyStatus = "available";
-        if (startStatusBefore === "available") applyStatus = "if_need_be";
-        else if (startStatusBefore === "if_need_be")
-          applyStatus = "unavailable";
-
-        const updatedDateVotes = { ...dateVotes };
-        for (let h = start; h <= end; h++) {
-          const hVotes = updatedDateVotes[h] ? { ...updatedDateVotes[h] } : {};
-          hVotes[myMemberId] = applyStatus;
-          updatedDateVotes[h] = hVotes;
-        }
-
-        const updatedVotes = {
-          ...currentVotes,
-          [dateId]: updatedDateVotes,
-        };
-
-        try {
-          const roomRef = doc(
-            db,
-            "artifacts",
-            appId,
-            "public",
-            "data",
-            "rehearsalRooms",
-            roomId
-          );
-          await setDoc(roomRef, { votes: updatedVotes }, { merge: true });
-        } catch (err) {
-          console.error("Range fill error:", err);
-        }
-
-        // 연속 선택 모드 종료
-        setRangeStartHour(null);
-        setIsRangeMode(false);
-        return;
-      }
-    }
-
-    // 단일 탭 처리
-    const updatedDateVotes = {
-      ...dateVotes,
-      [hour]: {
-        ...hourVotes,
-        [myMemberId]: nextStatus,
-      },
-    };
-
-    const updatedVotes = {
-      ...currentVotes,
-      [dateId]: updatedDateVotes,
-    };
-
-    try {
-      const roomRef = doc(
-        db,
-        "artifacts",
-        appId,
-        "public",
-        "data",
-        "rehearsalRooms",
-        roomId
-      );
-      await setDoc(roomRef, { votes: updatedVotes }, { merge: true });
-    } catch (err) {
-      console.error("Toggle slot error:", err);
-    }
-  };
-
-  const handleQuickPresetFill = async (presetType) => {
-    if (!user || !roomId || !myMemberId || !roomData || !selectedDateId) return;
-
-    const currentVotes = { ...(roomData.votes || {}) };
-    const dateVotes = { ...(currentVotes[selectedDateId] || {}) };
-
-    roomHours.forEach((slot) => {
-      const h = slot.hour;
-      const hourVotes = { ...(dateVotes[h] || {}) };
-
-      if (presetType === "evening") {
-        hourVotes[myMemberId] =
-          h >= 18 && h <= 22 ? "available" : "unavailable";
-      } else if (presetType === "all") {
-        hourVotes[myMemberId] = "available";
-      } else if (presetType === "clear") {
-        hourVotes[myMemberId] = "unavailable";
-      }
-      dateVotes[h] = hourVotes;
-    });
-
-    currentVotes[selectedDateId] = dateVotes;
-
-    try {
-      const roomRef = doc(
-        db,
-        "artifacts",
-        appId,
-        "public",
-        "data",
-        "rehearsalRooms",
-        roomId
-      );
-      await setDoc(roomRef, { votes: currentVotes }, { merge: true });
-    } catch (err) {
-      console.error("Preset fill error:", err);
-    }
-  };
-
   const handleCopyShareLink = () => {
     const fullUrl = `${window.location.origin}${window.location.pathname}#room=${roomId}`;
     navigator.clipboard.writeText(fullUrl);
@@ -507,7 +503,7 @@ export default function App() {
   };
 
   // ----------------------------------------------------
-  // 5. CALCULATE BEST CONTINUOUS REHEARSAL SLOTS (TOP 5)
+  // 6. CALCULATE BEST CONTINUOUS REHEARSAL SLOTS (TOP 5)
   // ----------------------------------------------------
   const bestRehearsalSlots = useMemo(() => {
     if (
@@ -521,10 +517,9 @@ export default function App() {
     const membersList = Object.values(roomData.members);
     if (membersList.length === 0) return [];
 
-    const votes = roomData.votes || {};
+    const votes = localVotes || {};
     const candidateBlocks = [];
 
-    // Check 2-hour blocks across all dates
     roomDates.forEach((day) => {
       const dayVotes = votes[day.id] || {};
 
@@ -584,25 +579,8 @@ export default function App() {
     });
 
     return candidateBlocks.sort((a, b) => b.score - a.score).slice(0, 5);
-  }, [roomData, roomDates, roomHours]);
+  }, [roomData, localVotes, roomDates, roomHours]);
 
-  // Helper for counting user's marked available hours for a given day
-  const getUserHourCountForDay = (dateId) => {
-    if (!roomData?.votes || !dateId || !myMemberId) return 0;
-    const dateVotes = roomData.votes[dateId] || {};
-    let count = 0;
-    roomHours.forEach((slot) => {
-      if (
-        dateVotes[slot.hour] &&
-        dateVotes[slot.hour][myMemberId] === "available"
-      ) {
-        count++;
-      }
-    });
-    return count;
-  };
-
-  // Current Member Object
   const currentMemberObj = roomData?.members?.[myMemberId];
 
   // ==========================================
@@ -612,7 +590,6 @@ export default function App() {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 font-sans p-4 flex flex-col justify-center items-center">
         <div className="w-full max-w-md space-y-6">
-          {/* LOGO HEADER */}
           <div className="text-center space-y-2">
             <div className="inline-flex w-14 h-14 rounded-2xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 items-center justify-center text-white shadow-xl shadow-indigo-500/20">
               <Music className="w-8 h-8 stroke-[2.5]" />
@@ -621,12 +598,11 @@ export default function App() {
               Band Rehearsal Sync
             </h1>
             <p className="text-xs text-slate-400 max-w-xs mx-auto">
-              공연/합주 팀원들이 터치 한 번으로 가능한 시간을 맞추는 모바일
-              최적화 일정 공유 플랫폼
+              공연/합주 팀원들이 드래그 한 번으로 가능한 시간을 맞추는 일정 공유
+              플랫폼
             </p>
           </div>
 
-          {/* CREATE NEW ROOM FORM */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
             <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
               <Plus className="w-4 h-4 text-indigo-400" />
@@ -650,7 +626,6 @@ export default function App() {
                 />
               </div>
 
-              {/* DATE PICKERS (START & END DATE) */}
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-400 font-medium mb-1">
@@ -678,7 +653,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* TIME BOUNDS SELECTORS */}
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-400 font-medium mb-1">
@@ -725,7 +699,6 @@ export default function App() {
             </form>
           </div>
 
-          {/* JOIN EXISTING ROOM BY ID */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-xs space-y-3">
             <span className="font-bold text-slate-300 block">
               기존 초대 코드로 입장하기
@@ -842,21 +815,22 @@ export default function App() {
   }
 
   // ==========================================
-  // VIEW 3: MAIN APP SCREEN (VOTE & RESULTS)
+  // VIEW 3: MAIN APP SCREEN (MULTI-DAY DRAG GRID & RESULTS)
   // ==========================================
-  const membersCount = Object.keys(roomData?.members || {}).length;
+  const membersList = Object.values(roomData?.members || {});
+  const membersCount = membersList.length;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans pb-28">
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans pb-24">
       {/* APP TOP HEADER */}
       <header className="sticky top-0 z-30 bg-slate-900/95 backdrop-blur-md border-b border-slate-800 px-4 py-3 shadow-md">
-        <div className="max-w-md mx-auto flex items-center justify-between">
+        <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-500 to-violet-600 flex items-center justify-center text-white shadow-md">
               <Music className="w-5 h-5" />
             </div>
             <div>
-              <h1 className="font-extrabold text-sm text-white leading-tight truncate max-w-[180px]">
+              <h1 className="font-extrabold text-sm text-white leading-tight truncate max-w-[180px] sm:max-w-xs">
                 {roomData?.bandName}
               </h1>
               <p className="text-[10px] text-slate-400 flex items-center gap-1">
@@ -876,7 +850,12 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
+            {isSaving && (
+              <span className="text-[10px] text-indigo-300 animate-pulse">
+                저장 중...
+              </span>
+            )}
             <button
               onClick={handleCopyShareLink}
               className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow flex items-center gap-1.5 active:scale-95 transition-all"
@@ -889,7 +868,7 @@ export default function App() {
       </header>
 
       {/* MAIN CONTENT WRAPPER */}
-      <main className="max-w-md mx-auto px-4 pt-3 space-y-4">
+      <main className="max-w-3xl mx-auto px-3 sm:px-4 pt-3 space-y-3">
         {/* TAB SEGMENT CONTROL */}
         <div className="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-xs font-medium">
           <button
@@ -927,229 +906,180 @@ export default function App() {
           </button>
         </div>
 
-        {/* TAB 1: TIME SCHEDULE INPUT */}
+        {/* TAB 1: MULTI-DAY DRAG GRID */}
         {activeTab === "vote" && (
-          <div className="space-y-3">
-            {/* HORIZONTAL DATE CAROUSEL */}
-            <div className="bg-slate-900/90 rounded-2xl p-2.5 border border-slate-800">
-              <div className="text-[11px] text-slate-400 font-medium px-1 mb-2 flex justify-between items-center">
-                <span>날짜 선택 (가로 스크롤 가능)</span>
-                <span className="text-indigo-400 font-bold">
-                  {roomDates.find((d) => d.id === selectedDateId)?.monthNum}월{" "}
-                  {roomDates.find((d) => d.id === selectedDateId)?.dateNum}일
-                </span>
+          <div className="space-y-2.5">
+            {/* PAINT BRUSH & QUICK PRESETS BAR */}
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-900/80 p-2.5 rounded-xl border border-slate-800 text-xs">
+              {/* Brush Mode Selector */}
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setPaintMode("available")}
+                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
+                    paintMode === "available"
+                      ? "bg-emerald-600 text-white border-emerald-400 shadow"
+                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
+                  }`}
+                >
+                  🟢 가능
+                </button>
+                <button
+                  onClick={() => setPaintMode("if_need_be")}
+                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
+                    paintMode === "if_need_be"
+                      ? "bg-amber-600 text-white border-amber-400 shadow"
+                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
+                  }`}
+                >
+                  🟡 조율
+                </button>
+                <button
+                  onClick={() => setPaintMode("unavailable")}
+                  className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all ${
+                    paintMode === "unavailable"
+                      ? "bg-rose-600 text-white border-rose-400 shadow"
+                      : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
+                  }`}
+                >
+                  🔴 지우기
+                </button>
               </div>
 
-              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-thin scrollbar-thumb-slate-700">
-                {roomDates.map((day) => {
-                  const isSelected = day.id === selectedDateId;
-                  const hourCount = getUserHourCountForDay(day.id);
-
-                  return (
-                    <button
-                      key={day.id}
-                      onClick={() => setSelectedDateId(day.id)}
-                      className={`min-w-[56px] flex flex-col items-center py-2 px-1.5 rounded-xl transition-all relative ${
-                        isSelected
-                          ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/30 scale-105 font-bold"
-                          : "bg-slate-950/80 hover:bg-slate-800 text-slate-300 border border-slate-800"
-                      }`}
-                    >
-                      <span
-                        className={`text-[10px] ${
-                          isSelected
-                            ? "text-indigo-200"
-                            : day.isWeekend
-                            ? "text-amber-400"
-                            : "text-slate-400"
-                        }`}
-                      >
-                        {day.dayName}
-                      </span>
-                      <span className="text-xs font-black my-0.5">
-                        {day.monthNum}/{day.dateNum}
-                      </span>
-
-                      {hourCount > 0 ? (
-                        <span
-                          className={`text-[9px] px-1.5 rounded-full font-extrabold ${
-                            isSelected
-                              ? "bg-white text-indigo-700"
-                              : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                          }`}
-                        >
-                          {hourCount}h
-                        </span>
-                      ) : (
-                        <span className="text-[9px] text-slate-600">-</span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* QUICK PRESET ACTION BUTTONS */}
-            <div className="flex items-center justify-between gap-1.5 text-xs bg-slate-900/60 p-2 rounded-xl border border-slate-800/80">
-              <button
-                onClick={() => {
-                  setIsRangeMode(!isRangeMode);
-                  setRangeStartHour(null);
-                }}
-                className={`px-2.5 py-1.5 rounded-lg font-bold border transition-all flex items-center gap-1 shadow-sm ${
-                  isRangeMode
-                    ? "bg-indigo-600 text-white border-indigo-500 shadow-indigo-600/30 ring-2 ring-indigo-500/50"
-                    : "bg-slate-800 hover:bg-slate-700 text-indigo-300 border-slate-700"
-                }`}
-              >
-                <span>↔️</span>
-                <span>{isRangeMode ? "선택 취소" : "연속 선택"}</span>
-              </button>
-
+              {/* Global Quick Presets */}
               <div className="flex items-center gap-1">
                 <button
                   onClick={() => handleQuickPresetFill("evening")}
-                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[11px] font-medium border border-slate-700"
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[11px] font-bold border border-slate-700"
                 >
-                  저녁
+                  저녁만
                 </button>
                 <button
                   onClick={() => handleQuickPresetFill("all")}
-                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 text-[11px] font-medium border border-slate-700"
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 text-[11px] font-bold border border-slate-700"
                 >
-                  전체
+                  전체 가능
                 </button>
                 <button
                   onClick={() => handleQuickPresetFill("clear")}
-                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-rose-300 text-[11px] font-medium border border-slate-700"
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-rose-300 text-[11px] font-bold border border-slate-700"
                 >
-                  초기화
+                  전체 취소
                 </button>
               </div>
             </div>
 
-            {/* RANGE MODE BANNER */}
-            {isRangeMode && (
-              <div className="bg-indigo-600/20 border border-indigo-500/50 text-indigo-200 text-[11px] font-bold py-2 px-3 rounded-xl text-center shadow-lg animate-pulse flex items-center justify-center gap-2">
-                {rangeStartHour === null
-                  ? "👇 시작할 시간을 먼저 탭하세요"
-                  : `👇 끝나는 시간을 탭하세요 (시작: ${rangeStartHour}:00)`}
+            <p className="text-[11px] text-slate-400 px-1">
+              💡 칸을 누른 채 드래그하면 여러 시간·요일이 한 번에 칠해집니다.
+              날짜 제목을 누르면 그날 하루 전체가 선택/취소됩니다.
+            </p>
+
+            {/* MULTI-DAY SCROLLABLE GRID */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+              <div className="overflow-x-auto">
+                <table
+                  className="w-full border-collapse select-none"
+                  onTouchMove={handleGridTouchMove}
+                >
+                  <thead>
+                    <tr className="bg-slate-950/90 border-b border-slate-800">
+                      <th className="sticky left-0 z-20 bg-slate-950 w-14 min-w-[56px] py-2.5 text-[10px] font-bold text-slate-400 border-r border-slate-800">
+                        시간
+                      </th>
+                      {roomDates.map((day) => (
+                        <th
+                          key={day.id}
+                          onClick={() => handleToggleDayColumn(day.id)}
+                          title="클릭하여 이 날짜 전체 선택/해제"
+                          className="min-w-[64px] py-2 px-1 text-center border-r border-slate-800/60 cursor-pointer hover:bg-slate-800/80 transition-colors"
+                        >
+                          <div
+                            className={`text-[10px] font-bold ${
+                              day.isWeekend
+                                ? "text-amber-400"
+                                : "text-slate-400"
+                            }`}
+                          >
+                            {day.dayName}
+                          </div>
+                          <div className="text-xs font-black text-slate-100">
+                            {day.monthNum}/{day.dateNum}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {roomHours.map((slot) => (
+                      <tr
+                        key={slot.hour}
+                        className="border-b border-slate-800/60 last:border-b-0"
+                      >
+                        {/* Sticky Time Column */}
+                        <td className="sticky left-0 z-10 bg-slate-950/95 text-[11px] font-bold text-slate-400 text-center py-2.5 border-r border-slate-800">
+                          {slot.shortLabel}
+                        </td>
+
+                        {/* Date Cells */}
+                        {roomDates.map((day) => {
+                          const hourVotes =
+                            localVotes?.[day.id]?.[slot.hour] || {};
+                          const myStatus =
+                            hourVotes[myMemberId] || "unavailable";
+
+                          let availCount = 0;
+                          membersList.forEach((m) => {
+                            if (hourVotes[m.id] === "available") availCount++;
+                          });
+
+                          let cellStyle =
+                            "bg-slate-900/50 hover:bg-slate-800/80 text-slate-500";
+                          if (myStatus === "available") {
+                            cellStyle =
+                              "bg-emerald-500/35 hover:bg-emerald-500/45 text-emerald-200 border-emerald-500/40";
+                          } else if (myStatus === "if_need_be") {
+                            cellStyle =
+                              "bg-amber-500/35 hover:bg-amber-500/45 text-amber-200 border-amber-500/40";
+                          }
+
+                          return (
+                            <td
+                              key={`${day.id}_${slot.hour}`}
+                              data-date={day.id}
+                              data-hour={slot.hour}
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                handleCellStart(day.id, slot.hour);
+                              }}
+                              onMouseEnter={() =>
+                                handleCellEnter(day.id, slot.hour)
+                              }
+                              onTouchStart={() =>
+                                handleCellStart(day.id, slot.hour)
+                              }
+                              className={`h-10 text-center border-r border-slate-800/50 cursor-pointer touch-none transition-colors duration-75 ${cellStyle}`}
+                            >
+                              <div className="flex flex-col items-center justify-center leading-none">
+                                <span className="text-[11px] font-extrabold">
+                                  {myStatus === "available"
+                                    ? "●"
+                                    : myStatus === "if_need_be"
+                                    ? "▲"
+                                    : ""}
+                                </span>
+                                {availCount > 0 && (
+                                  <span className="text-[9px] font-bold opacity-80 mt-0.5">
+                                    {availCount}/{membersCount}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-            )}
-
-            {/* HOURS SLOTS (1-HOUR BIG TOUCH CARDS) */}
-            <div className="space-y-2">
-              {roomHours.map((slot) => {
-                const dateVotes = roomData?.votes?.[selectedDateId] || {};
-                const hourVotes = dateVotes[slot.hour] || {};
-                const myStatus = hourVotes[myMemberId] || "unavailable";
-
-                const membersList = Object.values(roomData?.members || {});
-                let availableCount = 0;
-                membersList.forEach((m) => {
-                  if (hourVotes[m.id] === "available") availableCount++;
-                });
-
-                const isRangeStartTarget =
-                  isRangeMode && rangeStartHour === slot.hour;
-
-                return (
-                  <div
-                    key={slot.hour}
-                    onClick={() =>
-                      handleToggleSlotStatus(selectedDateId, slot.hour)
-                    }
-                    className={`group relative overflow-hidden rounded-2xl border p-3.5 transition-all duration-150 active:scale-[0.98] cursor-pointer select-none ${
-                      isRangeStartTarget
-                        ? "ring-2 ring-indigo-500 ring-offset-2 ring-offset-slate-950 shadow-[0_0_15px_rgba(99,102,241,0.5)] z-10"
-                        : ""
-                    } ${
-                      myStatus === "available"
-                        ? "bg-emerald-950/30 border-emerald-500/60 shadow-md"
-                        : myStatus === "if_need_be"
-                        ? "bg-amber-950/30 border-amber-500/60 shadow-md"
-                        : "bg-slate-900/80 border-slate-800 hover:border-slate-700"
-                    }`}
-                  >
-                    <div
-                      className={`absolute top-0 bottom-0 left-0 w-1.5 ${
-                        myStatus === "available"
-                          ? "bg-emerald-500"
-                          : myStatus === "if_need_be"
-                          ? "bg-amber-500"
-                          : "bg-slate-700"
-                      }`}
-                    />
-
-                    <div className="flex items-center justify-between gap-2 pl-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-base font-black text-white tracking-tight">
-                          {slot.label}
-                        </span>
-                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
-                          {slot.tag}
-                        </span>
-                      </div>
-
-                      {/* 3-State Toggle Badge */}
-                      <div>
-                        {myStatus === "available" && (
-                          <span className="flex items-center gap-1 text-xs font-bold text-emerald-400 bg-emerald-500/20 border border-emerald-500/40 px-2.5 py-1 rounded-xl">
-                            <CheckCircle2 className="w-3.5 h-3.5 stroke-[2.5]" />
-                            가능 🟢
-                          </span>
-                        )}
-                        {myStatus === "if_need_be" && (
-                          <span className="flex items-center gap-1 text-xs font-bold text-amber-400 bg-amber-500/20 border border-amber-500/40 px-2.5 py-1 rounded-xl">
-                            <HelpCircle className="w-3.5 h-3.5 stroke-[2.5]" />
-                            조율 🟡
-                          </span>
-                        )}
-                        {myStatus === "unavailable" && (
-                          <span className="flex items-center gap-1 text-xs font-medium text-slate-400 bg-slate-800 border border-slate-700 px-2.5 py-1 rounded-xl">
-                            <XCircle className="w-3.5 h-3.5 opacity-60" />
-                            불가 🔴
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Member Breakdown Row */}
-                    <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex items-center justify-between gap-1 pl-1">
-                      <div className="flex items-center gap-1 overflow-x-auto scrollbar-none">
-                        {membersList.length === 0 ? (
-                          <span className="text-[10px] text-slate-500">
-                            참여 멤버 없음
-                          </span>
-                        ) : (
-                          membersList.map((m) => {
-                            const st = hourVotes[m.id] || "unavailable";
-                            return (
-                              <span
-                                key={m.id}
-                                className={`text-[10px] font-medium px-2 py-0.5 rounded-lg border flex items-center gap-1 ${
-                                  st === "available"
-                                    ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30 font-semibold"
-                                    : st === "if_need_be"
-                                    ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
-                                    : "bg-slate-950 text-slate-400 border-slate-800 line-through opacity-50"
-                                }`}
-                              >
-                                <span>{m.roleLabel.split(" ")[0]}</span>
-                                <span>{m.name}</span>
-                              </span>
-                            );
-                          })
-                        )}
-                      </div>
-
-                      <span className="text-[10px] font-bold text-slate-300 flex-shrink-0 bg-slate-800 px-2 py-0.5 rounded-md">
-                        {availableCount}/{membersList.length}명
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
             </div>
           </div>
         )}
@@ -1212,7 +1142,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Member Breakdown */}
                   <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5">
                     {slot.memberBreakdown.map((m) => (
                       <div
@@ -1256,7 +1185,7 @@ export default function App() {
               </div>
 
               <div className="space-y-2">
-                {Object.values(roomData?.members || {}).map((m) => (
+                {membersList.map((m) => (
                   <div
                     key={m.id}
                     className="flex items-center justify-between p-2.5 bg-slate-950 rounded-xl border border-slate-800"
@@ -1288,7 +1217,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Room Info Details */}
             <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 text-xs text-slate-400 space-y-1">
               <div>
                 초대 코드:{" "}
